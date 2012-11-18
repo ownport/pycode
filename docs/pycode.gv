@@ -1,0 +1,12 @@
+digraph pycode {
+
+    graph [ rankdir = "LR"];
+    node [shape=record,fontname=Arial,fontsize=9];
+    edge [arrowsize=0.5,fontname=Arial,fontsize=9];
+
+    // Nodes
+    render_code [label="render_code(str)"];
+    pycodestruct_struct [label="PyCodeStruct.struct()"];
+    // Links
+    render_code -> pycodestruct_struct;
+}
