@@ -5,13 +5,17 @@ pycode.py
 
 Simple script for python code analysis
 
-Based on standard module: pydoc
+Based on module pydoc from standard python library
 '''
+
+__author__ = 'Andrey Usov <https://github.com/ownport/pycode>'
+__version__ = '0.2'
 
 import os
 import re
 import sys
-import pydoc
+import json
+import types
 import pprint
 import inspect
 
@@ -22,68 +26,272 @@ try:
 except:
     import __builtin__ as _builtins
 
+# ------------------------------------------------
+# Exceptions
+# ------------------------------------------------
+
+class ErrorDuringImport(Exception):
+    """Errors that occurred while trying to import something to document it."""
+    def __init__(self, filename, exc_info):
+        exc, value, tb = exc_info
+        self.filename = filename
+        self.exc = exc
+        self.value = value
+        self.tb = tb
+
+    def __str__(self):
+        exc = self.exc
+        if type(exc) is types.ClassType:
+            exc = exc.__name__
+        return 'problem in %s - %s: %s' % (self.filename, exc, self.value)
+
+# ------------------------------------------------
+# Classes
+# ------------------------------------------------
 class _OldStyleClass: pass
 _OLD_INSTANCE_TYPE = type(_OldStyleClass())
 
-def ispath(x):
-    return isinstance(x, str) and x.find(os.sep) >= 0
 
-def describe(thing):
-    """Produce a short description of the given thing.
-    Returns (thing_name, description)"""
-    if inspect.ismodule(thing):
-        if thing.__name__ in sys.builtin_module_names:
-            return (thing.__name__, 'built-in module')
-        if hasattr(thing, '__path__'):
-            return (thing.__name__, 'package')
+class PyCodeStruct(object):
+    ''' extract code structure '''
+
+    def _struct_descriptor(self, name, value, mod):
+    
+        result = dict()
+        result['type'], realname = describe(value)
+        result['name'] = name or realname
+        result['doc'] = getdoc(value) or ''
+        return result
+
+    def struct(self, obj, name=None, *args):
+    
+        """Generate structure for an object."""
+        
+        args = (obj, name) + args
+        if inspect.isgetsetdescriptor(obj): return self.struct_data(*args)
+        if inspect.ismemberdescriptor(obj): return self.struct_data(*args)
+        if inspect.ismodule(obj): return self.struct_module(*args)
+        if inspect.isclass(obj): return self.struct_class(*args)
+        if inspect.isroutine(obj): return self.struct_routine(*args)
+        if isinstance(obj, property): return self.struct_property(*args)
+        return self.struct_date(*args)
+
+    def struct_data(self, obj, name=None, mod=None, cl=None):
+        """Produce structure for a data descriptor."""
+        if isinstance(obj, (bool, str, unicode, int, long, float, complex, tuple, list, dict)):
+            return dict([(name, obj),])
+        result = self._struct_descriptor(name, obj, mod)
+        if result and isinstance(result, dict):
+            cls_name = classname(cl, mod)
+            if cls_name:
+                result['belongs_to'] = cls_name
+        return result
+
+    def struct_class(self, obj, name=None, mod=None, *ignored):
+        """Produce structure for a given class object."""
+        
+        def spill(attrs):
+            # Data descriptors
+            # Other
+            result = None
+            name, kind, homecls, value = attr
+            if kind in ('method', 'class method', 'static method'):
+                result = self.struct(value, name, mod, homecls)
+            elif kind in ('data'):
+                result = self.struct_data(value, name, mod, homecls)
+            if not result:
+                raise RuntimeError('Unknown attribute: {}'.format(attr))
+            if isinstance(result, dict):
+                result['belongs_to'] = classname(homecls, mod)
+            return result
+        
+        result = dict()
+        result['type'], realname = describe(obj)
+        result['name'] = name or realname
+
+        if name and name <> realname:
+            result['decl'] = name + ' = class ' + realname
+ 
+        result['doc'] = getdoc(obj)
+
+        # List the mro, if non-trivial.
+        mro = inspect.getmro(obj)
+        if len(mro) > 1:
+            result['bases'] = map(lambda c, m=obj.__module__: classname(c,m), mro[1:])
+
+        attrs = filter(lambda data: visiblename(data[0], obj=obj),
+                       inspect.classify_class_attrs(obj))
+        
+        obj_attrs = filter(lambda data: data[2] is obj, attrs)
+        inherited_attrs = set(attrs) - set(obj_attrs)
+        result['class_attrs'] = [spill(attr) for attr in obj_attrs]
+        result['inherited attrs'] = [spill(attr) for attr in inherited_attrs]
+        return result
+
+    def struct_routine(self, obj, name=None, mod=None, cl=None):
+        """Produce code structure for a function or method object."""
+        
+        result = dict()
+        result['type'], realname = describe(obj)
+        result['name'] = name or realname
+
+        if inspect.ismethod(obj):
+            imclass = obj.im_class
+            if cl:
+                if imclass is not cl:
+                    result['note'] = 'from ' + classname(imclass, mod)
+            else:
+                if obj.im_self is not None:
+                    result['note'] = 'method of %s instance' % classname(
+                        obj.im_self.__class__, mod)
+                else:
+                    result['note'] = 'unbound %s method' % classname(imclass,mod)
+            obj = obj.im_func
+
+        if inspect.isfunction(obj):
+            args, varargs, varkw, defaults = inspect.getargspec(obj)
+            argspec = inspect.formatargspec(args, varargs, varkw, defaults)
+            if result['name'] == '<lambda>':
+                argspec = argspec[1:-1] # remove parentheses
         else:
-            return (thing.__name__, 'module')
-    if inspect.isbuiltin(thing):
-        return (thing.__name__, 'built-in function')
-    if inspect.isgetsetdescriptor(thing):
-        return (thing.__name__,
-                'getset descriptor %s.%s.%s' % (thing.__objclass__.__module__, 
-                                                thing.__objclass__.__name__))
-    if inspect.ismemberdescriptor(thing):
-        return (thing.__name__,
-                'member descriptor %s.%s.%s' % (thing.__objclass__.__module__, 
-                                                thing.__objclass__.__name__))
-    if inspect.isclass(thing):
-        return (thing.__name__, 'class') 
-    if inspect.isfunction(thing):
-        return (thing.__name__, 'function')
-    if inspect.ismethod(thing):
-        return (thing.__name__, 'method')
-    if type(thing) is types.InstanceType:
-        return (thing.__name__, 'instance of ' + thing.__class__.__name__)
-    return (thing.__name__, type(thing).__name__)
+            argspec = '(...)'
+        result['decl'] = result['name'] + argspec
+        result['doc'] = getdoc(obj) or ''
+        return result
 
-def safeimport(path, forceload=0, cache={}):
+    def struct_module(self, obj, name=None, mod=None):
+        """Produce structure for a given module object."""
+        
+        result = dict()
+
+        # if __all__ exists, believe it.  Otherwise use old heuristic.
+        try:
+            _all = obj.__all__
+        except AttributeError:
+            _all = None
+
+        docloc = getdocloc(obj)
+        if docloc:
+            result['doc_location'] = docloc
+
+        # classes
+        classes = list()
+        for key, value in inspect.getmembers(obj, inspect.isclass):
+            if visiblename(key, _all, obj):
+                classes.append(self.struct_class(value, key))
+        if classes:
+            result['classes'] = classes
+
+        # functions
+        funcs = list()
+        for key, value in inspect.getmembers(obj, inspect.isroutine):
+            if visiblename(key, _all, obj):
+                funcs.append(self.struct_routine(value, key) )
+        if funcs:
+            result['funcs'] = funcs
+        # data
+        data = list()
+        for key, value in inspect.getmembers(obj, isdata):
+            if visiblename(key, _all, obj) and value is not None:
+                data.append(self.struct_data(value, key, mod))
+        if data:
+            result['data'] = data
+        return result
+
+        # modules and packages
+        modules = list()
+        packages = list()
+        modpkgs_names = set()
+        if hasattr(obj, '__path__'):
+            for importer, modname, ispkg in pkgutil.iter_modules(obj.__path__):
+                modpkgs_names.add(modname)
+                if ispkg:
+                    packages.append(modname)
+                else:
+                    modules.append(modname)
+            if packages:
+                result['packages'] = packages
+            if modules:
+                result['modules'] = modules
+
+        # Detect submodules as sometimes created by C extensions
+        submodules = []
+        for key, value in inspect.getmembers(object, inspect.ismodule):
+            if value.__name__.startswith(name + '.') and key not in modpkgs_names:
+                submodules.append(key)
+        if submodules:
+            result['submodules'] = submodules
+        return result
+
+
+
+# ------------------------------------------------
+# Utils
+# ------------------------------------------------
+
+def dict2flat(root_name, source, removeEmptyFields=False):
+    ''' returns a simplified "flat" form of the complex hierarchical dictionary '''
+    
+    def is_simple_elements(source):
+        ''' check if the source contains simple element types,
+        not lists, tuples, dicts
+        '''
+        for i in source:
+            if isinstance(i, (list, tuple, dict)):
+                return False
+        return True
+    
+    flat_dict = {}
+    if isinstance(source, (list, tuple)):
+        if not is_simple_elements(source):
+            for i,e in enumerate(source):
+                new_root_name = "%s[%d]" % (root_name,i)
+                for k,v in dict2flat(new_root_name,e).items():
+                    flat_dict[k] = v
+        else:
+            flat_dict[root_name] = source
+    elif isinstance(source, dict):
+        for k,v in source.items():
+            if root_name:
+                new_root_name = "%s.%s" % (root_name, k)
+            else:
+                new_root_name = "%s" % k
+            for kk, vv in dict2flat(new_root_name,v).items():
+                flat_dict[kk] = vv
+    else:
+        if source is not None:
+            flat_dict[root_name] = source
+    return flat_dict
+
+def importfile(path):
+    """Import a Python source file or compiled file given its path."""
+    import imp
+    
+    magic = imp.get_magic()
+    file = open(path, 'r')
+    if file.read(len(magic)) == magic:
+        kind = imp.PY_COMPILED
+    else:
+        kind = imp.PY_SOURCE
+    file.close()
+    filename = os.path.basename(path)
+    name, ext = os.path.splitext(filename)
+    file = open(path, 'r')
+    try:
+        module = imp.load_module(name, file, path, (ext, 'r', kind))
+    except:
+        raise ErrorDuringImport(path, sys.exc_info())
+    file.close()
+    return module
+
+def safeimport(path):
     """Import a module; handle errors; return None if the module isn't found.
 
     If the module *is* found but an exception occurs, it's wrapped in an
     ErrorDuringImport exception and reraised.  Unlike __import__, if a
     package path is specified, the module at the end of the path is returned,
-    not the package at the beginning.  If the optional 'forceload' argument
-    is 1, we reload the module from disk (unless it's a dynamic extension)."""
+    not the package at the beginning."""
     try:
-        # If forceload is 1 and the module has been previously loaded from
-        # disk, we always have to reload the module.  Checking the file's
-        # mtime isn't good enough (e.g. the module could contain a class
-        # that inherits from another module that has changed).
-        if forceload and path in sys.modules:
-            if path not in sys.builtin_module_names:
-                # Avoid simply calling reload() because it leaves names in
-                # the currently loaded module lying around if they're not
-                # defined in the new source file.  Instead, remove the
-                # module from sys.modules and re-import.  Also remove any
-                # submodules because they won't appear in the newly loaded
-                # module's namespace if they're already in sys.modules.
-                subs = [m for m in sys.modules if m.startswith(path + '.')]
-                for key in [path] + subs:
-                    # Prevent garbage collection.
-                    cache[key] = sys.modules[key]
-                    del sys.modules[key]
         module = __import__(path)
     except:
         # Did the error occur before or after the module was found?
@@ -130,21 +338,138 @@ def resolve(thing):
     if isinstance(thing, str):
         obj = locate(thing)
         if not obj:
-            raise ImportError, 'no Python code found for %r' % thing
+            raise ImportError, 'Cannot detect code structure for %r' % thing
         return obj, thing
     else:
         name = getattr(thing, '__name__', None)
         return thing, name if isinstance(name, str) else None
 
-def render_code(code):
-    """Render python code, given an object or a path to an object."""
+def describe(thing):
+    """Produce a short description of the given thing.
+    returns thing's type and name """
+    
+    # inspect.isgeneratorfunction(object)
+    # inspect.isgenerator(object)
+    # inspect.istraceback(object)
+    # inspect.isframe(object)
+    # inspect.iscode(object)
+    # inspect.isroutine(object)
+    # inspect.isabstract(object)
+    # inspect.ismethoddescriptor(object)
+    # inspect.isdatadescriptor(object)
+    
+    if inspect.ismodule(thing):
+        if thing.__name__ in sys.builtin_module_names:
+            return ('built-in module', thing.__name__)
+        if hasattr(thing, '__path__'):
+            return ('package', thing.__name__)
+        else:
+            return ('module', thing.__name__)
+    if inspect.isbuiltin(thing):
+        return ('built-in function', thing.__name__)
+    if inspect.isgetsetdescriptor(thing):
+        return (
+            'getset descriptor', 
+            '%s.%s.%s' % (  thing.__objclass__.__module__, 
+                            thing.__objclass__.__name__,
+                            thing.__name__))
+    if inspect.ismemberdescriptor(thing):
+        return (
+            'member descriptor', 
+            '%s.%s.%s' % (  thing.__objclass__.__module__, 
+                            thing.__objclass__.__name__,
+                            thing.__name__))
+    if inspect.isclass(thing):
+        return ('class', thing.__name__)
+    if inspect.isfunction(thing):
+        return ('function', thing.__name__)
+    if inspect.ismethod(thing):
+        return ('method', thing.__name__)
+    if type(thing) is types.InstanceType:
+        return ('instance of', thing.__class__.__name__)
+    return (type(thing).__name__, '')
+
+def isdata(object):
+    """Check if an object is of a type that probably means it's data."""
+    return not (inspect.ismodule(object) or inspect.isclass(object) or
+                inspect.isroutine(object) or inspect.isframe(object) or
+                inspect.istraceback(object) or inspect.iscode(object))
+
+def classname(obj, modname):
+    """Get a class name and qualify it with a module name if necessary."""
+    try:
+        name = obj.__name__
+    except AttributeError, err:
+        return None
+    if obj.__module__ != modname:
+        name = obj.__module__ + '.' + name
+    return name
+
+def getdoc(obj):
+    """Get the doc string or comments for an object."""
+    result = inspect.getdoc(obj) or inspect.getcomments(obj)
+    return result and re.sub('^ *\n', '', result.rstrip()) or ''
+
+def getdocloc(obj):
+    """Return the location of module docs or None"""
+
+    try:
+        file = inspect.getabsfile(obj)
+    except TypeError:
+        file = '(built-in)'
+
+    docloc = os.environ.get("PYTHONDOCS",
+                            "http://docs.python.org/library")
+    basedir = os.path.join(sys.exec_prefix, "lib",
+                           "python"+sys.version[0:3])
+    if (isinstance(obj, type(os)) and
+        (obj.__name__ in ('errno', 'exceptions', 'gc', 'imp',
+                             'marshal', 'posix', 'signal', 'sys',
+                             'thread', 'zipimport') or
+         (file.startswith(basedir) and
+          not file.startswith(os.path.join(basedir, 'dist-packages')) and
+          not file.startswith(os.path.join(basedir, 'site-packages')))) and
+        object.__name__ not in ('xml.etree', 'test.pydoc_mod')):
+        if docloc.startswith("http://"):
+            docloc = "%s/%s" % (docloc.rstrip("/"), obj.__name__)
+        else:
+            docloc = os.path.join(docloc, obj.__name__ + ".html")
+    else:
+        docloc = None
+    return docloc
+
+
+def visiblename(name, all=None, obj=None):
+    """Decide whether to show variable."""
+    # Certain special names are redundant.
+    _hidden_names = ('__builtins__', '__doc__', '__file__', '__path__',
+                     '__module__', '__name__', '__slots__', '__package__')
+    if name in _hidden_names: return 0
+    # Private names are hidden, but special names are displayed.
+    if name.startswith('__') and name.endswith('__'): return 1
+    # Namedtuples have public fields and methods with a single leading underscore
+    if name.startswith('_') and hasattr(obj, '_fields'):
+        return 1
+    if all is not None:
+        # only exported in __all__
+        return name in all
+    else:
+        return not name.startswith('_')
+
+def struct_code(thing):
+    """ returns code structure, given an object or a path to an object."""
     result = dict()
-    obj, name = resolve(code)
-    result['name'] = name
-    desc, obj_type = describe(obj)
-    result['object_type'] = obj_type
+    obj, result['name'] = resolve(thing)    
+    result['type'], name = describe(obj)
     module = inspect.getmodule(obj)
-    result['module'] = module
+    result['module_name'] = module.__name__
+    result['module_doc'] = module.__doc__
+
+    try:
+        result['file'] = inspect.getabsfile(obj)
+    except TypeError:
+        result['file'] = '(built-in)'
+    
     if type(obj) is _OLD_INSTANCE_TYPE:
         # If the passed object is an instance of an old-style class,
         # document its available methods instead of its value.
@@ -158,392 +483,17 @@ def render_code(code):
         # If the passed object is a piece of data or an instance,
         # document its available methods instead of its value.
         obj = type(obj)
-        desc += ' object'
-    result['object'] = obj
-    result['description'] = desc
     code_struct = PyCodeStruct()
-    result['struct'] = code_struct.struct(obj, name)
+    result['struct'] = code_struct.struct(obj, result['name'])
     return result
-
-class PyCodeStruct(object):
-    """Formatter class for text documentation."""
-
-    def struct(self, obj, name=None, *args):
-    
-        """Generate structure for an object."""
         
-        args = (obj, name) + args
-        if inspect.isgetsetdescriptor(obj): return self.data_struct(*args)
-        if inspect.ismemberdescriptor(obj): return self.data_struct(*args)
-        if inspect.ismodule(obj): return self.module_struct(*args)
-        if inspect.isclass(obj): return self.class_struct(*args)
-        if inspect.isroutine(obj): return self.routine_struct(*args)
-        if isinstance(obj, property): return self.property_struct(*args)
-        return self.other_struct(*args)
-
-    def fail(self, object, name=None, *args):
-        """Raise an exception for unimplemented types."""
-        message = "don't know how to document object%s of type %s" % (
-            name and ' ' + repr(name), type(object).__name__)
-        raise TypeError, message
-
-    def getdocloc(self, object):
-        """Return the location of module docs or None"""
-
-        try:
-            file = inspect.getabsfile(object)
-        except TypeError:
-            file = '(built-in)'
-
-        docloc = os.environ.get("PYTHONDOCS",
-                                "http://docs.python.org/library")
-        basedir = os.path.join(sys.exec_prefix, "lib",
-                               "python"+sys.version[0:3])
-        if (isinstance(object, type(os)) and
-            (object.__name__ in ('errno', 'exceptions', 'gc', 'imp',
-                                 'marshal', 'posix', 'signal', 'sys',
-                                 'thread', 'zipimport') or
-             (file.startswith(basedir) and
-              not file.startswith(os.path.join(basedir, 'dist-packages')) and
-              not file.startswith(os.path.join(basedir, 'site-packages')))) and
-            object.__name__ not in ('xml.etree', 'test.pydoc_mod')):
-            if docloc.startswith("http://"):
-                docloc = "%s/%s" % (docloc.rstrip("/"), object.__name__)
-            else:
-                docloc = os.path.join(docloc, object.__name__ + ".html")
-        else:
-            docloc = None
-        return docloc
-
-    def bold(self, text):
-        """Format a string in bold by overstriking."""
-        return join(map(lambda ch: ch + '\b' + ch, text), '')
-
-    def indent(self, text, prefix='    '):
-        """Indent text by prepending a given prefix to each line."""
-        if not text: return ''
-        lines = split(text, '\n')
-        lines = map(lambda line, prefix=prefix: prefix + line, lines)
-        if lines: lines[-1] = rstrip(lines[-1])
-        return join(lines, '\n')
-
-    def section(self, title, contents):
-        """Format a section with a given heading."""
-        return self.bold(title) + '\n' + rstrip(self.indent(contents)) + '\n\n'
-
-    # ---------------------------------------------- type-specific routines
-
-    def formattree(self, tree, modname, parent=None):
-        """Render in text a class tree as returned by inspect.getclasstree()."""
-        struct = list()
-        for entry in tree:
-            if type(entry) is type(()):
-                c, bases = entry
-                struct.append(pydoc.classname(c, modname))
-                if bases and bases != (parent,):
-                    parents = map(lambda c, m=modname: pydoc.classname(c, m), bases)
-                    #result = result + '(%s)' % join(parents, ', ')
-                #result = result + '\n'
-            elif type(entry) is type([]):
-                struct.append(self.formattree(entry, modname, c))
-        return struct
-
-    def module_struct(self, object, name=None, mod=None):
-        """Produce structure for a given module object."""
-        
-        struct = dict()
-        name = object.__name__ # ignore the passed-in name
-        struct['synop'], struct['description'] = pydoc.splitdoc(pydoc.getdoc(object))
-
-        try:
-            all = object.__all__
-        except AttributeError:
-            all = None
-
-        try:
-            struct['file'] = inspect.getabsfile(object)
-        except TypeError:
-            struct['file'] = '(built-in)'
-
-        docloc = self.getdocloc(object)
-        if docloc is not None:
-            struct['module_docs'] = docloc
-
-        classes = []
-        for key, value in inspect.getmembers(object, inspect.isclass):
-            # if __all__ exists, believe it.  Otherwise use old heuristic.
-            if (all is not None
-                or (inspect.getmodule(value) or object) is object):
-                if pydoc.visiblename(key, all, object):
-                    classes.append((key, value))
-        funcs = []
-        for key, value in inspect.getmembers(object, inspect.isroutine):
-            # if __all__ exists, believe it.  Otherwise use old heuristic.
-            if (all is not None or
-                inspect.isbuiltin(value) or inspect.getmodule(value) is object):
-                if pydoc.visiblename(key, all, object):
-                    funcs.append((key, value))
-        data = []
-        for key, value in inspect.getmembers(object, pydoc.isdata):
-            if pydoc.visiblename(key, all, object):
-                data.append((key, value))
-
-        modpkgs = []
-        modpkgs_names = set()
-        if hasattr(object, '__path__'):
-            for importer, modname, ispkg in pkgutil.iter_modules(object.__path__):
-                modpkgs_names.add(modname)
-                if ispkg:
-                    modpkgs.append(modname + ' (package)')
-                else:
-                    modpkgs.append(modname)
-
-            modpkgs.sort()
-            struct['package_contents'] = '\n'.join(modpkgs)
-
-        # Detect submodules as sometimes created by C extensions
-        submodules = []
-        for key, value in inspect.getmembers(object, inspect.ismodule):
-            if value.__name__.startswith(name + '.') and key not in modpkgs_names:
-                submodules.append(key)
-        if submodules:
-            submodules.sort()
-            result = result + self.section(
-                'SUBMODULES', join(submodules, '\n'))
-
-        if classes:
-            classlist = map(lambda key_value: key_value[1], classes)
-            contents = [self.formattree(
-                inspect.getclasstree(classlist, 1), name)]
-            for key, value in classes:
-                contents.append(self.document(value, key, name))
-            result = result + self.section('CLASSES', join(contents, '\n'))
-
-        if funcs:
-            contents = []
-            for key, value in funcs:
-                contents.append(self.document(value, key, name))
-            result = result + self.section('FUNCTIONS', join(contents, '\n'))
-
-        if data:
-            contents = []
-            for key, value in data:
-                contents.append(self.docother(value, key, name, maxlen=70))
-            result = result + self.section('DATA', join(contents, '\n'))
-
-        if hasattr(object, '__version__'):
-            version = str(object.__version__)
-            if version[:11] == '$' + 'Revision: ' and version[-1:] == '$':
-                version = strip(version[11:-1])
-            result = result + self.section('VERSION', version)
-        if hasattr(object, '__date__'):
-            result = result + self.section('DATE', str(object.__date__))
-        if hasattr(object, '__author__'):
-            result = result + self.section('AUTHOR', str(object.__author__))
-        if hasattr(object, '__credits__'):
-            result = result + self.section('CREDITS', str(object.__credits__))
-        return struct
-
-    def docclass(self, object, name=None, mod=None, *ignored):
-        """Produce text documentation for a given class object."""
-        realname = object.__name__
-        name = name or realname
-        bases = object.__bases__
-
-        def makename(c, m=object.__module__):
-            return classname(c, m)
-
-        if name == realname:
-            title = 'class ' + self.bold(realname)
-        else:
-            title = self.bold(name) + ' = class ' + realname
-        if bases:
-            parents = map(makename, bases)
-            title = title + '(%s)' % join(parents, ', ')
-
-        doc = getdoc(object)
-        contents = doc and [doc + '\n'] or []
-        push = contents.append
-
-        # List the mro, if non-trivial.
-        mro = deque(inspect.getmro(object))
-        if len(mro) > 2:
-            push("Method resolution order:")
-            for base in mro:
-                push('    ' + makename(base))
-            push('')
-
-        # Cute little class to pump out a horizontal rule between sections.
-        class HorizontalRule:
-            def __init__(self):
-                self.needone = 0
-            def maybe(self):
-                if self.needone:
-                    push('-' * 70)
-                self.needone = 1
-        hr = HorizontalRule()
-
-        def spill(msg, attrs, predicate):
-            ok, attrs = _split_list(attrs, predicate)
-            if ok:
-                hr.maybe()
-                push(msg)
-                for name, kind, homecls, value in ok:
-                    try:
-                        value = getattr(object, name)
-                    except Exception:
-                        # Some descriptors may meet a failure in their __get__.
-                        # (bug #1785)
-                        push(self._docdescriptor(name, value, mod))
-                    else:
-                        push(self.document(value,
-                                        name, mod, object))
-            return attrs
-
-        def spilldescriptors(msg, attrs, predicate):
-            ok, attrs = _split_list(attrs, predicate)
-            if ok:
-                hr.maybe()
-                push(msg)
-                for name, kind, homecls, value in ok:
-                    push(self._docdescriptor(name, value, mod))
-            return attrs
-
-        def spilldata(msg, attrs, predicate):
-            ok, attrs = _split_list(attrs, predicate)
-            if ok:
-                hr.maybe()
-                push(msg)
-                for name, kind, homecls, value in ok:
-                    if (hasattr(value, '__call__') or
-                            inspect.isdatadescriptor(value)):
-                        doc = getdoc(value)
-                    else:
-                        doc = None
-                    push(self.docother(getattr(object, name),
-                                       name, mod, maxlen=70, doc=doc) + '\n')
-            return attrs
-
-        attrs = filter(lambda data: visiblename(data[0], obj=object),
-                       classify_class_attrs(object))
-        while attrs:
-            if mro:
-                thisclass = mro.popleft()
-            else:
-                thisclass = attrs[0][2]
-            attrs, inherited = _split_list(attrs, lambda t: t[2] is thisclass)
-
-            if thisclass is __builtin__.object:
-                attrs = inherited
-                continue
-            elif thisclass is object:
-                tag = "defined here"
-            else:
-                tag = "inherited from %s" % classname(thisclass,
-                                                      object.__module__)
-
-            # Sort attrs by name.
-            attrs.sort()
-
-            # Pump out the attrs, segregated by kind.
-            attrs = spill("Methods %s:\n" % tag, attrs,
-                          lambda t: t[1] == 'method')
-            attrs = spill("Class methods %s:\n" % tag, attrs,
-                          lambda t: t[1] == 'class method')
-            attrs = spill("Static methods %s:\n" % tag, attrs,
-                          lambda t: t[1] == 'static method')
-            attrs = spilldescriptors("Data descriptors %s:\n" % tag, attrs,
-                                     lambda t: t[1] == 'data descriptor')
-            attrs = spilldata("Data and other attributes %s:\n" % tag, attrs,
-                              lambda t: t[1] == 'data')
-            assert attrs == []
-            attrs = inherited
-
-        contents = '\n'.join(contents)
-        if not contents:
-            return title + '\n'
-        return title + '\n' + self.indent(rstrip(contents), ' |  ') + '\n'
-
-    def formatvalue(self, object):
-        """Format an argument default value as text."""
-        return '=' + self.repr(object)
-
-    def docroutine(self, object, name=None, mod=None, cl=None):
-        """Produce text documentation for a function or method object."""
-        realname = object.__name__
-        name = name or realname
-        note = ''
-        skipdocs = 0
-        if inspect.ismethod(object):
-            imclass = object.im_class
-            if cl:
-                if imclass is not cl:
-                    note = ' from ' + classname(imclass, mod)
-            else:
-                if object.im_self is not None:
-                    note = ' method of %s instance' % classname(
-                        object.im_self.__class__, mod)
-                else:
-                    note = ' unbound %s method' % classname(imclass,mod)
-            object = object.im_func
-
-        if name == realname:
-            title = self.bold(realname)
-        else:
-            if (cl and realname in cl.__dict__ and
-                cl.__dict__[realname] is object):
-                skipdocs = 1
-            title = self.bold(name) + ' = ' + realname
-        if inspect.isfunction(object):
-            args, varargs, varkw, defaults = inspect.getargspec(object)
-            argspec = inspect.formatargspec(
-                args, varargs, varkw, defaults, formatvalue=self.formatvalue)
-            if realname == '<lambda>':
-                title = self.bold(name) + ' lambda '
-                argspec = argspec[1:-1] # remove parentheses
-        else:
-            argspec = '(...)'
-        decl = title + argspec + note
-
-        if skipdocs:
-            return decl + '\n'
-        else:
-            doc = getdoc(object) or ''
-            return decl + '\n' + (doc and rstrip(self.indent(doc)) + '\n')
-
-    def _docdescriptor(self, name, value, mod):
-        results = []
-        push = results.append
-
-        if name:
-            push(self.bold(name))
-            push('\n')
-        doc = getdoc(value) or ''
-        if doc:
-            push(self.indent(doc))
-            push('\n')
-        return ''.join(results)
-
-    def docproperty(self, object, name=None, mod=None, cl=None):
-        """Produce text documentation for a property."""
-        return self._docdescriptor(name, object, mod)
-
-    def docdata(self, object, name=None, mod=None, cl=None):
-        """Produce text documentation for a data descriptor."""
-        return self._docdescriptor(name, object, mod)
-
-    def other_struct(self, obj, name=None, mod=None, parent=None, maxlen=None, doc=None):
-        """Produce structure for a data object."""
-        return {name: str(obj)}
-
-    
 def cli():
     """Command-line interface (looks at sys.argv to decide what to do)."""
 
-    import os
-    import sys
     import getopt
-    class BadUsage: pass
+
+    def ispath(x):
+        return isinstance(x, str) and x.find(os.sep) >= 0
 
     # Scripts don't get the current directory in their path by default
     # unless they are run with the '-m' switch
@@ -553,18 +503,16 @@ def cli():
             sys.path.remove(scriptdir)
         sys.path.insert(0, '.')
     
-    try:
-        if len(sys.argv) < 2:
-            raise BadUsage
+    if len(sys.argv) <= 2:
         for arg in sys.argv[1:]:
-            if ispath(arg) and not os.path.exists(arg):
-                print 'file %r does not exist' % arg
-                break
+            if ispath(arg) and os.path.exists(arg):
+                arg = importfile(arg)
             try:
-                pprint.pprint(render_code(arg))
+                #pprint.pprint(struct_code(arg))
+                print json.dumps(struct_code(arg))
             except ImportError, err:
                 print err
-    except BadUsage:
+    else:
         cmd = os.path.basename(sys.argv[0])
         print """pycode.py - python code analysis
 
