@@ -97,7 +97,7 @@ class PyCodeStruct(object):
             name, kind, homecls, value = attr
             if kind in ('method', 'class method', 'static method'):
                 result = self.struct(value, name, mod, homecls)
-            elif kind in ('data'):
+            elif kind in ('data', 'property'):
                 result = self.struct_data(value, name, mod, homecls)
             if not result:
                 raise RuntimeError('Unknown attribute: {}'.format(attr))
